@@ -1,0 +1,144 @@
+#!/usr/bin/env ruby
+# ffautoconv.rb: Program for transcoding videos for streaming them to Samsung TVs.
+# Author: Thomas Weininger (http://blog.weinimo.de)
+# This program is free software: you can redistribute it and/or modify it under the terms of the BSD license.
+
+require 'find'
+require 'rubygems'
+require 'streamio-ffmpeg'
+
+def containerChange (movie, filename, container)
+  if File.extname(filename) != "." + container
+    $logfile.write("New container of  #{filename} will be: #{container}.
+     \n  Original file: #{movie.video_codec}, acodec: #{movie.audio_codec}\n")
+    newfilename = filename.chomp(File.extname(filename)) + ".#{container}"
+    movie.transcode(newfilename, "-vcodec copy -acodec copy -copyts")
+
+    # Check whether container change was successful.
+    newmovie = FFMPEG::Movie.new(newfilename)
+    if newmovie.valid?
+      $logfile.write("  Container format changed successfully. Deleting " + filename + ".\n\n")
+      File.delete(filename)
+    else
+      $logfile.write("  Error occured while trying to change the container format. Deleting " + newfilename + ".\n\n")
+      File.delete(newfilename)
+    end
+  else
+    $logfile.write("Container of " + filename + " doesn't have to be changed" +
+      ".\n  Original file: #{movie.video_codec}, acodec: #{movie.audio_codec}.\n\n")
+  end
+end
+
+def reencode (movie, filename, acodec, vcodec, container)
+  # Decide whether we need to transcode or only a container change.
+  if movie.audio_codec.nil?                                                     # Prevent NoMethodError if no audio track is available.
+    orig_acodec = ""
+  else
+    orig_acodec = movie.audio_codec
+  end
+
+  if ( ( orig_acodec.match(/^#{acodec}(.*)/) && movie.video_codec.match(/^#{vcodec}(.*)/) ) ||
+       ( acodec == "copy" && vcodec == "copy" ) )
+    containerChange(movie, filename, container)
+  else
+    $logfile.write("New Codecs of #{filename} will be: #{vcodec}, #{acodec}, #{container}.\n" +
+      "  Original file: #{movie.video_codec}, acodec: #{movie.audio_codec}.\n")
+    $logfile.flush
+    newfilename = filename.chomp(File.extname(filename)) + ".#{container}"
+    options = { :threads => 0 }
+    customopts = ""
+
+    if ( movie.video_codec.match(/^#{vcodec}(.*)/) || vcodec == "copy" )        # Can we use the video track from the original file?
+      customopts = "#{customopts} -copyts"
+      options = options.merge({ :video_codec => "copy", :custom => customopts })
+    else
+      case vcodec
+      when "h264"
+        customopts = "#{customopts} -qscale 0"
+        options = options.merge({ :video_codec => "libx264", :custom => customopts })
+      end
+    end
+
+    if ( orig_acodec.match(/^#{acodec}(.*)/) || acodec == "copy" )        # Can we use the audio track from the original file?
+      options = options.merge({ :audio_codec => "copy" })
+    else
+      case acodec
+      when "aac"
+        customopts = "#{customopts} -aq 120"
+        options = options.merge({ :audio_codec => "libfaac", :custom => customopts })
+      end
+    end
+
+    begin
+      puts "\nTranscoding: #{filename}.\n"
+      beginning_time = Time.now
+      movie.transcode(newfilename, options) { |progress| print "\r#{Integer(progress*100)}%" }
+      total_secs = Time.now - beginning_time
+      combined_mins = (total_secs / 60).floor
+      combined_secs = (total_secs % 60).floor
+      $logfile.write("  Time elapsed: #{combined_mins} minutes, #{combined_secs} seconds (#{total_secs} seconds).\n")
+    rescue RuntimeError => e
+      $logfile.write("  RUNTIME ERROR occured!!!\n\n")
+      return
+    rescue Interrupt => e
+      puts "SIGINT caught. Deleting #{newfilename} and exiting after that."
+      File.delete(newfilename)
+      exit
+    end
+
+    # Check whether transcoding was successful.
+    newmovie = FFMPEG::Movie.new(newfilename)
+    if newmovie.valid?
+      $logfile.write("  Transcoding completed successfully. Deleting " + filename + ".\n\n")
+      File.delete(filename)
+    else
+      $logfile.write("  Error occured while transcoding. Deleting " + newfilename + ".\n\n")
+      File.delete(newfilename)
+    end
+  end
+end
+
+$logfile = File.open("/tmp/ffautoconv.log", File::WRONLY|File::TRUNC|File::CREAT|File::APPEND)
+FFMPEG::logger.level = Logger::WARN
+
+ARGV.each do |a|
+  Find.find(a) do |f|
+    movie = FFMPEG::Movie.new(f)
+    if movie.valid?
+      dstACodec = "copy"                                                        # Always use the old audio track.
+
+      # Decide new video codec depending on the video codec of the original file.
+      case movie.video_codec
+      when /^h264(.*)/, /^mpeg4(.*)/, /^wmv3(.*)/                               # Video codecs that don't need to be transcoded.
+        dstVCodec = "copy"
+      when /^flv(.*)/, /^vp6f(.*)/, /^msmpeg4(.*)/, /^theora(.*)/,
+           /^wmv1(.*)/, /^wmv2(.*)/, /^vc1(.*)/, /^rv40(.*)/                    # Video codecs that need to be transcoded.
+        dstVCodec = "h264"
+      when /^mpeg2video(.*)/, /^mpeg1video(.*)/                                 # MPEG videos need special treatment.
+      when /^mjpeg(.*)/
+        next
+      else
+        $logfile.write("#{f}: vcodec not handled: #{movie.video_codec}, acodec: #{movie.audio_codec}\n\n")
+        next
+      end
+
+      # Decide which container format we should take depending on the audio codec of the original file.
+      case movie.audio_codec
+      when nil?, /aac(.*)/, /mp3(.*)/, /ac3(.*)/                                # ffmpeg mp4 does NOT support WMA, but wmv does. See http://en.wikipedia.org/wiki/Comparison_of_container_formats
+        dstACodec = "aac" if movie.video_codec =~ /^vp6f(.*)/
+        # Change container for audio formats that are supported by the mp4 container.
+        dstContainer ||= "mp4"
+      when /cook(.*)/
+        dstACodec = "aac"
+        dstContainer ||= "mp4"
+      else # wmav2, sipr
+        # Matroska offers the best format support for all possible audio codecs.
+        dstContainer ||= "mkv"
+      end
+
+      reencode(movie, f, dstACodec, dstVCodec, dstContainer)
+      $logfile.flush
+    end
+  end
+end
+$logfile.close
